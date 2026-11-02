@@ -1,0 +1,14 @@
+[package]
+name = "ferrydock-server"
+version = "0.1.0"
+edition = "2021"
+description = "Headless Ferrydock server (for testing and standalone use)."
+license = "MIT"
+
+[dependencies]
+ferrydock-core = { path = "../ferrydock-core" }
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "5"

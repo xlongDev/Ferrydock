@@ -1,0 +1,23 @@
+# Rust
+/target
+**/target
+Cargo.lock.bak
+
+# Node / frontend
+src/node_modules
+src/dist
+src/.vite
+
+# Tauri build output
+src-tauri/target
+src-tauri/gen/schemas/*.json
+
+# pnpm occasionally writes this; we are not a pnpm workspace
+src/pnpm-workspace.yaml
+
+# Local app data (config.json, api-key) — never commit
+Ferrydock/
+*.ferrydock-*.bak
+
+# OS
+.DS_Store

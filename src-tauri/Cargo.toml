@@ -1,0 +1,32 @@
+[package]
+name = "ferrydock"
+version = "0.1.0"
+description = "A better OpenAI-compatible gateway for WorkBuddy: multi-provider, failover, circuit breaking."
+authors = ["xlongDev"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "ferrydock_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "ferrydock"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+tracing = "0.1"
+ferrydock-core = { path = "../ferrydock-core" }
+
+[features]
+# This feature is used for production builds where `devUrl` is disabled.
+custom-protocol = ["tauri/custom-protocol"]
