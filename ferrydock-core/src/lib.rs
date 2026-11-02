@@ -6,9 +6,10 @@ pub mod error;
 pub mod metrics;
 pub mod providers;
 pub mod router;
+pub mod runtime;
 pub mod server;
 pub mod sync;
 
 pub use config::{Config, ProviderConfig, ProviderKind};
 pub use error::{Error, Result};
-pub use router::{Engine, ModelEntry};
+pub use router::{ChatOutcome, Engine, ModelEntry};

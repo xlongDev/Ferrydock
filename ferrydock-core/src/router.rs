@@ -1,7 +1,8 @@
-use crate::config::Config;
+use crate::config::{Config, ProviderKind};
 use crate::error::{Error, Result};
 use crate::metrics::{Circuit, MetricsStore};
-use crate::providers::GenericProvider;
+use crate::providers::{AnyProvider, GenericProvider, OpenCodeLocalProvider, ProviderChatResult};
+use crate::runtime::OpenCodeRuntime;
 use rand::Rng;
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -9,9 +10,16 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 
 pub const OWNER: &str = "ferrydock-v1";
+
+/// Result of routing a chat request: either forward a live upstream response,
+/// or return a locally-built OpenAI-shaped JSON body (native providers).
+pub enum ChatOutcome {
+    Stream(reqwest::Response),
+    Json(String),
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelEntry {
@@ -29,7 +37,7 @@ pub struct ModelEntry {
 }
 
 pub(crate) struct Inner {
-    providers: Vec<Arc<GenericProvider>>,
+    providers: Vec<Arc<AnyProvider>>,
     pub(crate) catalog: Vec<ModelEntry>,
     native_index: HashMap<String, Vec<String>>,
 }
@@ -45,6 +53,9 @@ pub struct Engine {
     #[allow(dead_code)]
     data_dir: PathBuf,
     config_path: PathBuf,
+    /// Local OpenCode runtime (keyless free models). Lazily started; reused
+    /// across reloads until it dies.
+    runtime: Mutex<Option<OpenCodeRuntime>>,
 }
 
 impl Engine {
@@ -68,6 +79,7 @@ impl Engine {
             api_key,
             data_dir,
             config_path,
+            runtime: Mutex::new(None),
         };
         let engine = Arc::new(engine);
         {
@@ -98,12 +110,27 @@ impl Engine {
         *self.client.write().await = client;
         *self.config.write().await = cfg.clone();
 
-        let providers: Vec<Arc<GenericProvider>> = cfg
-            .providers
-            .iter()
-            .filter(|p| p.enabled)
-            .map(|p| Arc::new(GenericProvider::new(p.clone())))
-            .collect();
+        // Build providers. OpenCodeLocal is backed by a locally-managed
+        // `opencode serve` runtime (keyless free models); the others are
+        // plain OpenAI-compatible upstreams.
+        let mut providers: Vec<Arc<AnyProvider>> = Vec::new();
+        for p in cfg.providers.iter().filter(|p| p.enabled) {
+            match p.kind {
+                ProviderKind::OpenCodeLocal => {
+                    match self.ensure_runtime().await {
+                        Ok((base, pw)) => providers.push(Arc::new(AnyProvider::Native(
+                            OpenCodeLocalProvider::new(p.clone(), base, pw),
+                        ))),
+                        Err(e) => {
+                            tracing::warn!("opencode-local runtime unavailable: {e}");
+                        }
+                    }
+                }
+                _ => providers.push(Arc::new(AnyProvider::OpenAI(GenericProvider::new(
+                    p.clone(),
+                )))),
+            }
+        }
         for p in &providers {
             self.metrics.ensure(p.id());
         }
@@ -154,9 +181,63 @@ impl Engine {
         Ok(())
     }
 
+    /// Ensure the local OpenCode runtime is up; return its base URL + password.
+    async fn ensure_runtime(&self) -> Result<(String, String)> {
+        let local_http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .map_err(|e| Error::Config(format!("build local client: {e}")))?;
+        let mut guard = self.runtime.lock().await;
+        let need_new = match guard.as_ref() {
+            Some(rt) => {
+                match local_http
+                    .get(format!("{}/global/health", rt.base_url()))
+                    .timeout(Duration::from_secs(2))
+                    .send()
+                    .await
+                {
+                    Ok(r) => match r.json::<Value>().await {
+                        Ok(v) => !v.get("healthy").and_then(|x| x.as_bool()).unwrap_or(false),
+                        Err(_) => true,
+                    },
+                    Err(_) => true,
+                }
+            }
+            None => true,
+        };
+        if need_new {
+            if let Some(old) = guard.take() {
+                drop(old);
+            }
+            // Pick the download proxy from config (system proxy only if enabled).
+            let proxy_url: Option<String> = {
+                let cfg = self.config.read().await;
+                match &cfg.proxy_url {
+                    Some(u) if !u.is_empty() => Some(u.clone()),
+                    None => {
+                        if cfg.use_system_proxy {
+                            scutil_proxy()
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            let rt = OpenCodeRuntime::ensure(&self.data_dir, proxy_url.as_deref()).await?;
+            let base = rt.base_url().to_string();
+            let pw = rt.password().to_string();
+            *guard = Some(rt);
+            return Ok((base, pw));
+        }
+        let rt = guard.as_ref().unwrap();
+        Ok((rt.base_url().to_string(), rt.password().to_string()))
+    }
+
     /// Route a chat completion request across candidate providers with
     /// failover, circuit breaking, bounded concurrency and exponential backoff.
-    pub async fn chat(&self, body: Value) -> Result<reqwest::Response> {
+    pub async fn chat(&self, body: Value) -> Result<ChatOutcome> {
         let catalog_id = body
             .get("model")
             .and_then(|m| m.as_str())
@@ -171,7 +252,7 @@ impl Engine {
                 .find(|e| e.id == catalog_id)
                 .cloned()
                 .ok_or_else(|| Error::NoModel(catalog_id.clone()))?;
-            let mut cands: Vec<Arc<GenericProvider>> = Vec::new();
+            let mut cands: Vec<Arc<AnyProvider>> = Vec::new();
             if let Some(ids) = inner.native_index.get(&entry.native) {
                 for pid in ids {
                     if let Some(p) = inner.providers.iter().find(|p| p.id() == pid) {
@@ -181,7 +262,7 @@ impl Engine {
             }
             cands.sort_by_key(|p| {
                 let home = if p.id() == entry.provider_id { 0u32 } else { 1u32 };
-                home + p.cfg.priority
+                home + p.priority()
             });
             (entry, cands)
         };
@@ -210,13 +291,13 @@ impl Engine {
                 let start = Instant::now();
                 let client = self.client.read().await.clone();
                 match provider.chat(&entry.native, &body, &client).await {
-                    Ok(resp) => {
+                    Ok(ProviderChatResult::Upstream(resp)) => {
                         let status = resp.status();
                         if status.is_success() {
                             let ms = start.elapsed().as_millis() as f64;
                             self.metrics.record_success(provider.id(), ms);
                             self.circuit_success(provider.id());
-                            return Ok(resp);
+                            return Ok(ChatOutcome::Stream(resp));
                         }
                         let code = status.as_u16();
                         let txt = resp.text().await.unwrap_or_default();
@@ -231,6 +312,12 @@ impl Engine {
                         if code != 429 && (400..500).contains(&code) {
                             break;
                         }
+                    }
+                    Ok(ProviderChatResult::Json(s)) => {
+                        let ms = start.elapsed().as_millis() as f64;
+                        self.metrics.record_success(provider.id(), ms);
+                        self.circuit_success(provider.id());
+                        return Ok(ChatOutcome::Json(s));
                     }
                     Err(e) => {
                         self.metrics.record_error(provider.id(), &e.to_string());

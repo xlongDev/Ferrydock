@@ -18,5 +18,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "5"
 futures-util = "0.3"
 rand = "0.8"
+sha2 = "0.10"
+tar = "0.4"
+flate2 = "1"
+base64 = "0.22"
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors"] }

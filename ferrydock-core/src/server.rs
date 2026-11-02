@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::router::Engine;
+use crate::router::{ChatOutcome, Engine};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header::CONTENT_TYPE};
@@ -83,7 +83,7 @@ async fn chat_handler(
         .and_then(|s| s.as_bool())
         .unwrap_or(false);
     match engine.chat(body).await {
-        Ok(resp) => {
+        Ok(ChatOutcome::Stream(resp)) => {
             let status = resp.status();
             if stream {
                 let ct = resp.headers().get(CONTENT_TYPE).cloned();
@@ -112,6 +112,49 @@ async fn chat_handler(
                         }
                     },
                     Err(e) => error_resp(StatusCode::BAD_GATEWAY, &format!("read upstream: {e}")),
+                }
+            }
+        }
+        Ok(ChatOutcome::Json(s)) => {
+            if stream {
+                // Translate the synthetic completion into a single SSE chunk so
+                // streaming clients (WorkBuddy) parse it like any other stream.
+                let content = serde_json::from_str::<Value>(&s)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("choices")
+                            .and_then(|c| c.get(0))
+                            .and_then(|c0| c0.get("message"))
+                            .and_then(|m| m.get("content"))
+                            .and_then(|c| c.as_str())
+                            .map(|x| x.to_string())
+                    })
+                    .unwrap_or_default();
+                let chunk = json!({
+                    "id": "chatcmpl-fd-stream",
+                    "object": "chat.completion.chunk",
+                    "created": 0,
+                    "model": "",
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant", "content": content},
+                        "finish_reason": "stop"
+                    }]
+                })
+                .to_string();
+                let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+                let mut r = Response::new(Body::from(sse));
+                *r.status_mut() = StatusCode::OK;
+                r.headers_mut()
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
+                r
+            } else {
+                match serde_json::from_str::<Value>(&s) {
+                    Ok(v) => Json(v).into_response(),
+                    Err(e) => error_resp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("bad synthetic json: {e}"),
+                    ),
                 }
             }
         }

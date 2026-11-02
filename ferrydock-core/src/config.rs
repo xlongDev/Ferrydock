@@ -5,7 +5,13 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum ProviderKind {
+    /// OpenCode Zen: OpenAI-compatible endpoint reachable by external clients,
+    /// requires an API key. Disabled by default (needs a key).
     OpenCodeFree,
+    /// Local OpenCode runtime: Ferrydock downloads/launches an isolated
+    /// `opencode serve`, then talks to it over OpenCode's native protocol.
+    /// No API key needed — this is the keyless free-model path (same as OC Ferry).
+    OpenCodeLocal,
     OpenRouter,
     Ollama,
     Custom,
@@ -99,13 +105,25 @@ fn default_log_level() -> String {
 
 fn default_providers() -> Vec<ProviderConfig> {
     vec![
+        // Keyless free models via a locally-managed OpenCode runtime (OC Ferry's path).
         ProviderConfig {
-            id: "opencode-free".into(),
-            kind: ProviderKind::OpenCodeFree,
+            id: "opencode-local".into(),
+            kind: ProviderKind::OpenCodeLocal,
             enabled: true,
             base_url: None,
             api_key: None,
             priority: 0,
+            model_filter: None,
+            extra_models: None,
+        },
+        // OpenCode Zen (external, needs a key) — off until the user supplies one.
+        ProviderConfig {
+            id: "opencode-free".into(),
+            kind: ProviderKind::OpenCodeFree,
+            enabled: false,
+            base_url: None,
+            api_key: None,
+            priority: 1,
             model_filter: None,
             extra_models: None,
         },
@@ -115,7 +133,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             enabled: true,
             base_url: None,
             api_key: None,
-            priority: 1,
+            priority: 2,
             model_filter: None,
             extra_models: None,
         },
@@ -125,7 +143,7 @@ fn default_providers() -> Vec<ProviderConfig> {
             enabled: false,
             base_url: None,
             api_key: None,
-            priority: 2,
+            priority: 3,
             model_filter: None,
             extra_models: None,
         },

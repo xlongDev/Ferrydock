@@ -1,3 +1,6 @@
+pub mod opencode_local;
+pub use opencode_local::OpenCodeLocalProvider;
+
 use crate::config::{ProviderConfig, ProviderKind};
 use crate::error::{Error, Result};
 use reqwest::Client;
@@ -16,10 +19,17 @@ pub struct ModelInfo {
 
 pub fn default_base_url(kind: ProviderKind) -> &'static str {
     match kind {
-        ProviderKind::OpenCodeFree => "https://opencode.ai/inference/openai/v1",
+        // OpenCode Zen: the OpenAI-compatible endpoint reachable by EXTERNAL
+        // clients. OpenCode's free `/inference` tier is 403 to anything but the
+        // in-client OpenCode runtime (that's why OC Ferry shells out to a local
+        // `opencode serve`), so a standalone gateway must use Zen with a key.
+        ProviderKind::OpenCodeFree => "https://opencode.ai/zen/v1",
         ProviderKind::OpenRouter => "https://openrouter.ai/api/v1",
         ProviderKind::Ollama => "http://localhost:11434/v1",
         ProviderKind::Custom => "http://localhost:11434/v1",
+        // OpenCodeLocal's base URL is injected at runtime from the local
+        // `opencode serve`; this default is never used for it.
+        ProviderKind::OpenCodeLocal => "http://127.0.0.1:0/opencode-local",
     }
 }
 
@@ -161,5 +171,59 @@ impl GenericProvider {
             .await
             .map_err(|e| Error::Client(format!("chat {}: {e}", self.chat_url())))?;
         Ok(resp)
+    }
+}
+
+/// Outcome of a provider chat: either a live upstream response to forward, or
+/// a finished OpenAI-shaped JSON body produced by a native (non-OpenAI) provider.
+pub enum ProviderChatResult {
+    Upstream(reqwest::Response),
+    Json(String),
+}
+
+/// A provider is either an OpenAI-compatible upstream (`GenericProvider`) or a
+/// native-protocol upstream (`OpenCodeLocalProvider`). The router treats them
+/// uniformly for model listing and routing.
+pub enum AnyProvider {
+    OpenAI(GenericProvider),
+    Native(OpenCodeLocalProvider),
+}
+
+impl AnyProvider {
+    pub fn id(&self) -> &str {
+        match self {
+            AnyProvider::OpenAI(p) => p.id(),
+            AnyProvider::Native(p) => p.id(),
+        }
+    }
+
+    pub fn priority(&self) -> u32 {
+        match self {
+            AnyProvider::OpenAI(p) => p.cfg.priority,
+            AnyProvider::Native(p) => p.cfg.priority,
+        }
+    }
+
+    pub async fn list_models(&self, client: &Client) -> Result<Vec<ModelInfo>> {
+        match self {
+            AnyProvider::OpenAI(p) => p.list_models(client).await,
+            AnyProvider::Native(p) => p.list_models(client).await,
+        }
+    }
+
+    pub async fn chat(
+        &self,
+        native: &str,
+        body: &Value,
+        client: &Client,
+    ) -> Result<ProviderChatResult> {
+        match self {
+            AnyProvider::OpenAI(p) => {
+                Ok(ProviderChatResult::Upstream(p.chat(native, body, client).await?))
+            }
+            AnyProvider::Native(p) => {
+                Ok(ProviderChatResult::Json(p.chat(native, body, client).await?))
+            }
+        }
     }
 }
