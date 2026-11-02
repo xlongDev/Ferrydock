@@ -59,11 +59,7 @@ impl OpenCodeLocalProvider {
             .await
             .map_err(|e| Error::Client(format!("parse provider: {e}")))?;
         let mut out = Vec::new();
-        if let Some(all) = v
-            .get("providers")
-            .and_then(|p| p.get("all"))
-            .and_then(|a| a.as_array())
-        {
+        if let Some(all) = v.get("all").and_then(|a| a.as_array()) {
             if let Some(oc) = all
                 .iter()
                 .find(|p| p.get("id").and_then(|i| i.as_str()) == Some("opencode"))

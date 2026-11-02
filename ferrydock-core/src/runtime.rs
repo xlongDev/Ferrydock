@@ -14,9 +14,28 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::process::Command as TokioCommand;
 
-const PKG_NAME: &str = "opencode-ai";
-const BINARY: &str = "opencode";
+const BINARY: &str = if cfg!(windows) { "opencode.exe" } else { "opencode" };
 const REGISTRY: &str = "https://registry.npmjs.org";
+
+/// Map the host platform to the npm *platform package* that ships the real
+/// `opencode` binary. The `opencode-ai` wrapper package is just an installer
+/// (its tarball only contains a JS shim + a postinstall that fetches the
+/// platform package); the actual binary with `opencode serve` lives in
+/// `opencode-<platform>-<arch>` (e.g. `opencode-darwin-arm64`).
+fn npm_package() -> Result<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("opencode-darwin-arm64"),
+        ("macos", "x86_64") => Ok("opencode-darwin-x64"),
+        ("linux", "aarch64") => Ok("opencode-linux-arm64"),
+        ("linux", "x86_64") => Ok("opencode-linux-x64"),
+        ("windows", "aarch64") => Ok("opencode-windows-arm64"),
+        ("windows", "x86_64") => Ok("opencode-windows-x64"),
+        other => Err(Error::Config(format!(
+            "unsupported platform for opencode download: {}/{}",
+            other.0, other.1
+        ))),
+    }
+}
 
 pub struct OpenCodeRuntime {
     #[allow(dead_code)]
@@ -128,6 +147,7 @@ impl OpenCodeRuntime {
             }
             match local_http
                 .get(format!("{base_url}/global/health"))
+                .basic_auth("opencode", Some(&password))
                 .timeout(Duration::from_secs(2))
                 .send()
                 .await
@@ -199,7 +219,8 @@ async fn resolve_binary(data_dir: &Path, http: &Client) -> Result<PathBuf> {
 }
 
 async fn download_binary(data_dir: &Path, http: &Client) -> Result<PathBuf> {
-    let meta_url = format!("{REGISTRY}/{PKG_NAME}/latest");
+    let pkg = npm_package()?;
+    let meta_url = format!("{REGISTRY}/{pkg}/latest");
     let resp = http
         .get(&meta_url)
         .send()
