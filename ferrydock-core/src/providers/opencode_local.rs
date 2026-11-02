@@ -9,20 +9,27 @@
 use crate::config::ProviderConfig;
 use crate::error::{Error, Result};
 use crate::providers::{info_from_id, ModelInfo};
+use crate::runtime::OpenCodeRuntime;
 use reqwest::Client;
 use serde_json::{json, Value};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::Mutex;
 
 pub struct OpenCodeLocalProvider {
     pub cfg: ProviderConfig,
-    pub base_url: String,
-    pub password: String,
+    /// Shared handle to the *live* OpenCode runtime. We resolve the current
+    /// base URL + password from here on **every** request instead of caching
+    /// them at construction time. If the runtime crashes and is restarted on a
+    /// new port, the very next request sees the fresh endpoint — no 30s
+    /// stale-port lag where chat pings a dead port until the next reload.
+    runtime: Arc<Mutex<Option<OpenCodeRuntime>>>,
     /// Loopback-only client (always no-proxy) for talking to the runtime.
     client: reqwest::Client,
 }
 
 impl OpenCodeLocalProvider {
-    pub fn new(cfg: ProviderConfig, base_url: String, password: String) -> Self {
+    pub fn new(cfg: ProviderConfig, runtime: Arc<Mutex<Option<OpenCodeRuntime>>>) -> Self {
         let client = reqwest::Client::builder()
             .no_proxy()
             .timeout(std::time::Duration::from_secs(120))
@@ -30,9 +37,19 @@ impl OpenCodeLocalProvider {
             .expect("build opencode-local client");
         Self {
             cfg,
-            base_url,
-            password,
+            runtime,
             client,
+        }
+    }
+
+    /// Resolve the current runtime endpoint. Returns `Err` if the runtime is
+    /// not (yet) up; the router's circuit breaker will handle that rather than
+    /// us retrying here.
+    async fn endpoint(&self) -> Result<(String, String)> {
+        let guard = self.runtime.lock().await;
+        match guard.as_ref() {
+            Some(rt) => Ok((rt.base_url().to_string(), rt.password().to_string())),
+            None => Err(Error::Config("opencode local runtime not ready".into())),
         }
     }
 
@@ -41,11 +58,12 @@ impl OpenCodeLocalProvider {
     }
 
     pub async fn list_models(&self, _client: &Client) -> Result<Vec<ModelInfo>> {
-        let url = format!("{}/provider", self.base_url);
+        let (base_url, password) = self.endpoint().await?;
+        let url = format!("{base_url}/provider");
         let resp = self
             .client
             .get(&url)
-            .basic_auth("opencode", Some(&self.password))
+            .basic_auth("opencode", Some(&password))
             .send()
             .await
             .map_err(|e| Error::Client(format!("list_models {url}: {e}")))?;
@@ -97,12 +115,13 @@ impl OpenCodeLocalProvider {
         body: &Value,
         _client: &Client,
     ) -> Result<String> {
+        let (base_url, password) = self.endpoint().await?;
         // 1. open a session
-        let session_url = format!("{}/session", self.base_url);
+        let session_url = format!("{base_url}/session");
         let sresp = self
             .client
             .post(&session_url)
-            .basic_auth("opencode", Some(&self.password))
+            .basic_auth("opencode", Some(&password))
             .json(&json!({"title": "Ferrydock", "permission": []}))
             .send()
             .await
@@ -125,7 +144,7 @@ impl OpenCodeLocalProvider {
         let text = last_user_text(body);
 
         // 3. post the message (oc-ferry-chat: plain text, no tools)
-        let msg_url = format!("{}/session/{sid}/message", self.base_url);
+        let msg_url = format!("{base_url}/session/{sid}/message");
         let payload = json!({
             "model": {"providerID": "opencode", "modelID": native_model},
             "agent": "oc-ferry-chat",
@@ -134,7 +153,7 @@ impl OpenCodeLocalProvider {
         let mresp = self
             .client
             .post(&msg_url)
-            .basic_auth("opencode", Some(&self.password))
+            .basic_auth("opencode", Some(&password))
             .json(&payload)
             .send()
             .await

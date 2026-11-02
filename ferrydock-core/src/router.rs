@@ -54,8 +54,11 @@ pub struct Engine {
     data_dir: PathBuf,
     config_path: PathBuf,
     /// Local OpenCode runtime (keyless free models). Lazily started; reused
-    /// across reloads until it dies.
-    runtime: Mutex<Option<OpenCodeRuntime>>,
+    /// across reloads until it dies. Shared as an `Arc` so the native provider
+    /// can read the *current* base URL on every request (the runtime may be
+    /// restarted on a new port after a crash — the provider must see that
+    /// immediately, not the stale port it was built with).
+    runtime: Arc<Mutex<Option<OpenCodeRuntime>>>,
 }
 
 impl Engine {
@@ -79,12 +82,14 @@ impl Engine {
             api_key,
             data_dir,
             config_path,
-            runtime: Mutex::new(None),
+            runtime: Arc::new(Mutex::new(None)),
         };
         let engine = Arc::new(engine);
         {
             let e = engine.clone();
             e.spawn_background();
+            let e = engine.clone();
+            e.spawn_runtime_watch();
         }
         Ok(engine)
     }
@@ -97,6 +102,28 @@ impl Engine {
                 tick.tick().await;
                 if let Err(e) = eng.reload_and_probe().await {
                     tracing::warn!("periodic reload/probe failed: {e}");
+                }
+            }
+        });
+    }
+
+    /// Watch the local OpenCode runtime and restart it promptly if it dies.
+    ///
+    /// `reload_and_probe` only runs every 30s, so a crash could leave the
+    /// runtime dead (and on a *new* port once restarted) for up to 30s — during
+    /// which the native provider would ping a dead endpoint. This watcher pokes
+    /// `/global/health` every few seconds and recreates the runtime (new port)
+    /// the moment it's gone, so the shared handle the provider reads is updated
+    /// within seconds, not minutes.
+    fn spawn_runtime_watch(self: Arc<Self>) {
+        let eng = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                if let Err(e) = eng.ensure_runtime().await {
+                    tracing::warn!("opencode runtime watch: restart failed: {e}");
                 }
             }
         });
@@ -118,8 +145,8 @@ impl Engine {
             match p.kind {
                 ProviderKind::OpenCodeLocal => {
                     match self.ensure_runtime().await {
-                        Ok((base, pw)) => providers.push(Arc::new(AnyProvider::Native(
-                            OpenCodeLocalProvider::new(p.clone(), base, pw),
+                        Ok(()) => providers.push(Arc::new(AnyProvider::Native(
+                            OpenCodeLocalProvider::new(p.clone(), self.runtime.clone()),
                         ))),
                         Err(e) => {
                             tracing::warn!("opencode-local runtime unavailable: {e}");
@@ -181,8 +208,11 @@ impl Engine {
         Ok(())
     }
 
-    /// Ensure the local OpenCode runtime is up; return its base URL + password.
-    async fn ensure_runtime(&self) -> Result<(String, String)> {
+    /// Ensure the local OpenCode runtime is up. The native provider reads the
+    /// live base URL/password from the shared handle, so we only need to make
+    /// sure *a* runtime is present here (recreating it on a fresh port if the
+    /// old one died).
+    async fn ensure_runtime(&self) -> Result<()> {
         let local_http = reqwest::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(2))
@@ -226,13 +256,10 @@ impl Engine {
                 }
             };
             let rt = OpenCodeRuntime::ensure(&self.data_dir, proxy_url.as_deref()).await?;
-            let base = rt.base_url().to_string();
-            let pw = rt.password().to_string();
             *guard = Some(rt);
-            return Ok((base, pw));
+            return Ok(());
         }
-        let rt = guard.as_ref().unwrap();
-        Ok((rt.base_url().to_string(), rt.password().to_string()))
+        Ok(())
     }
 
     /// Route a chat completion request across candidate providers with
